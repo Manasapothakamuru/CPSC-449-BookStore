@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pymongo import MongoClient, ASCENDING, IndexModel
 from pydantic import BaseModel, Field
 from fastapi.responses import JSONResponse
@@ -8,50 +8,37 @@ import asyncio
 from motor.motor_asyncio import AsyncIOMotorClient
 
 app = FastAPI()
-client = MongoClient("mongodb://localhost:27017/")
-db = client.bookStore
 
-result = db.command({
-    "collMod": "books",
-    "validator": {
-        "$jsonSchema": {
-            "bsonType": "object",
-            "required": ["title", "author"],
-            "properties": {
-                "title": {
-                    "bsonType": "string"
-                },
-                "author": {
-                    "bsonType": "string"
-                },
-                "price": {
-                "type": "number",
-                "minimum": 0,
-                "maximum": 1000,
-                "exclusiveMaximum": False,
-                "exclusiveMinimum": False
-                }
-            }
-        }
-    },
-    "validationLevel": "strict",
-    "validationAction": "error"
-})
+# Mongo connection
+async def connect_to_mongodb():
+    client = AsyncIOMotorClient("mongodb://localhost:27017")
+    return client
 
-collection = db["books"]
+@app.on_event("startup")
+async def startup_event():
+    app.mongodb_client = await connect_to_mongodb()
+    await create_indexes()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    app.mongodb_client.close()
+
+# indexing fields
+async def create_indexes():
+    collection = app.mongodb_client.bookStore.books
+    await collection.create_index("title")
+    await collection.create_index("author")
 
 
-index_model = IndexModel("author")
-collection.create_indexes([index_model])
-
+#Pydantic Model with data validations
 class Book(BaseModel):
     book_id: str
     title: str = Field(..., min_length=1, max_length=50)
-    author: str
-    description: str
-    price: int = Field(..., gt=0)
-    stock: int = Field(..., gt=0)
-    sold_items: int = Field(..., gt=0)
+    author: str = Field(..., min_length=1, max_length=10)
+    description: str = Field(..., min_length=1, max_length=200)
+    price: int = Field(..., gt=10)
+    stock: int
+    sold_items: int
 
 class SearchPayload(BaseModel):
     searchBy : str
@@ -59,35 +46,46 @@ class SearchPayload(BaseModel):
     min: str
     max: str
 
+# Get all books from database
 @app.get("/books")
-def index():
+async def index():
+    collection = app.mongodb_client.bookStore.books
     result = collection.find()
     res = []
-    for i in result:
+    async for i in result:
         i["_id"] = str(i["_id"])
         res.append(i)
     return JSONResponse(content=res)
 
+# Get Book by id
 @app.get("/book/{book_id}")
 async def getbookById(book_id:str):
-    result = collection.find_one({"_id": ObjectId(book_id)})
+    collection = app.mongodb_client.bookStore.books
+    result = await collection.find_one({"_id": ObjectId(book_id)})
 
     if result:
         result["_id"] = str(result["_id"])
     return result
 
+# Create new book
 @app.post("/book")
-def create_user(book: Book):
+async def create_user(book: Book):
     print(book)
+    collection = app.mongodb_client.bookStore.books
     book_dict = book.dict()
     try:
-        collection.insert_one(book_dict) # to be checked failure 
+        result = await collection.insert_one(book_dict)
+        if result.inserted_id:
+            return {"message": "Book created successfully", "book_id": str(result.inserted_id)}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to create book")
     except WriteError as w:
-        return f"Saving record failed {w}"
-    return True
+        raise HTTPException(status_code=500, detail=f"Saving record failed: {w}")
 
+# update book 
 @app.put("/")
-def updateBook(book:Book):
+async def updateBook(book:Book):
+    collection = app.mongodb_client.bookStore.books
     book_dict = book.dict() 
     print(book_dict)
     book_id = book_dict["book_id"]
@@ -95,31 +93,32 @@ def updateBook(book:Book):
     book_oid = ObjectId(book_id)
 
     try:
-        result = collection.update_one(
+        result = await collection.update_one(
             {"_id": book_oid},
             {"$set": book_dict}
         )
+        if result.modified_count == 1:
+            return {"message": "Book updated successfully"}
+        else:
+            raise HTTPException(status_code=404, detail="Book not found")
     except WriteError as w:
-        print(f"Update book failed {w}")
-
-    if result.modified_count == 1:
-        return {"message": "Book updated successfully"}
-    else:
-        return {"message": "Book not found"}
+        raise HTTPException(status_code=500, detail=f"Update book failed: {w}")
 
 @app.delete("/books/{book_id}")
-def deleteBook(book_id: str):
-    result = collection.delete_one({"_id": ObjectId(book_id)})
+async def deleteBook(book_id: str):
+    collection = app.mongodb_client.bookStore.books
+    result = await collection.delete_one({"_id": ObjectId(book_id)})
     if result.deleted_count == 1:
         return {"message": f"Book with ID {book_id} has been deleted."}
     else:
         return {"message": "Book not found."}
-    
-@app.get("/search")
-def search(searchPayload: SearchPayload):
+
+# Search functionality using operators
+@app.get("/books/search")
+async def search(searchPayload: SearchPayload):
+    collection = app.mongodb_client.bookStore.books
     match searchPayload.searchBy:
         case "author":
-            print(searchPayload)
             result = collection.find({ "author": { "$eq": searchPayload.value } })
         case "title":
             result = collection.find({ "title": { "$eq": searchPayload.value } })
@@ -128,14 +127,15 @@ def search(searchPayload: SearchPayload):
         case _:
             return "Deafult case"
     res = []
-    for i in result:
-        print("helo")
+    async for i in result:
         i["_id"] = str(i["_id"])
         res.append(i)
     return JSONResponse(content=res)
 
+#Aggregation endpoint that return top 5 authors
 @app.get("/books/top5authors")
-def get_top_authors():
+async def get_top_authors():
+    collection = app.mongodb_client.bookStore.books
     pipeline = [
         {"$group": {"_id": "$author", "count": {"$sum": 2}}},
         {"$sort": {"count": -1}},
@@ -143,12 +143,14 @@ def get_top_authors():
     ]
     result = collection.aggregate(pipeline)
     authors = []
-    for doc in result:
+    async for doc in result:
         authors.append(doc['_id'])
     return {"authors": authors}
 
+# Aggregation end point that return top 5 selling books
 @app.get("/books/top-selling")
 async def get_top_selling_books():
+    collection = app.mongodb_client.bookStore.books
     pipeline = [
         {"$group": {"_id": "$title", "total_sold": {"$sum": "$sold_items"}}},
         {"$sort": {"total_sold": 1}},
@@ -156,21 +158,25 @@ async def get_top_selling_books():
     ]
     result = collection.aggregate(pipeline)
     books = []
-    for doc in result:
+    async for doc in result:
         books.append(doc['_id'])
     return {"books": books}
 
+# Aggregation end point that returns total number of books
 @app.get("/books/count")
 async def get_books_count():
-    count = collection.count_documents({})
+    collection = app.mongodb_client.bookStore.books
+    count = await collection.count_documents({})
     return {"count": count}
 
+# Purchase Book by id 
 @app.post("/books/purchase/{book_id}")
-def purchaseBook(book_id: str):
+async def purchaseBook(book_id: str):
+    collection = app.mongodb_client.bookStore.books
     query = {"_id": ObjectId(book_id)}
     update = {"$inc": {"sold_items": 1, "stock": -1}}
     try:
-        collection.update_one(query, update)
+        await collection.update_one(query, update)
     except WriteError as e:
         print(f"Purchase failed {e}")
         return False
