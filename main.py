@@ -1,13 +1,15 @@
 from fastapi import FastAPI
-from pymongo import MongoClient, ASCENDING 
-from pydantic import BaseModel
+from pymongo import MongoClient, ASCENDING, IndexModel
+from pydantic import BaseModel, Field
 from fastapi.responses import JSONResponse
 from bson.objectid import ObjectId
 from pymongo.errors import WriteError
+import asyncio
+from motor.motor_asyncio import AsyncIOMotorClient
 
 app = FastAPI()
 client = MongoClient("mongodb://localhost:27017/")
-db = client["bookStore"]
+db = client.bookStore
 
 result = db.command({
     "collMod": "books",
@@ -38,14 +40,18 @@ result = db.command({
 
 collection = db["books"]
 
+
+index_model = IndexModel("author")
+collection.create_indexes([index_model])
+
 class Book(BaseModel):
     book_id: str
-    title: str
+    title: str = Field(..., min_length=1, max_length=50)
     author: str
     description: str
-    price: int
-    stock: int
-    sold_items: int
+    price: int = Field(..., gt=0)
+    stock: int = Field(..., gt=0)
+    sold_items: int = Field(..., gt=0)
 
 class SearchPayload(BaseModel):
     searchBy : str
@@ -82,7 +88,7 @@ def create_user(book: Book):
 
 @app.put("/")
 def updateBook(book:Book):
-    book_dict = book.dict()
+    book_dict = book.dict() 
     print(book_dict)
     book_id = book_dict["book_id"]
     book_dict.pop("book_id", None)
