@@ -46,6 +46,8 @@ class SearchPayload(BaseModel):
     min: str
     max: str
 
+
+
 # Get all books from database
 @app.get("/books")
 async def index():
